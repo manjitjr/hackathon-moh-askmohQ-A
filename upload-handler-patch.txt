@@ -1,0 +1,43 @@
+    uploadBtn.addEventListener('click', async () => {
+        if (!selectedFile) return;
+        
+        uploadBtn.disabled = true;
+        statusSection.style.display = 'block';
+        resultsSection.style.display = 'none';
+        
+        updateStatus('Uploading file...', 20);
+        showNotification('Upload Started', 'Processing your Excel file...', 'info');
+        
+        const formData = new FormData();
+        formData.append('file', selectedFile);
+        formData.append('use_llm', aiToggle.checked ? 'true' : 'false');
+        console.log('🎚️ AI Toggle:', aiToggle.checked ? 'ON (AI Enabled)' : 'OFF (Rule-based)');
+        
+        try {
+            updateStatus(aiToggle.checked ? 'Processing with AI...' : 'Processing Excel file...', 40);
+            
+            const response = await fetch('http://localhost:5000/upload', {
+                method: 'POST',
+                body: formData
+            });
+            
+                uploadBtn.addEventListener('click', async () => {
+        if 
+        if (!selectedFile) return;
+        
+        t         
+        uploadBtn.disab);
+                 statusSection.style.displ);        resultsSection.style.display = 'none'on        
+        updateStatus('Uploading file         
+         showNotification('Upload Started', 'P()        
+        const formData = new FormData();
+        formData.append('file', s!'     );
+         formData.append('file', selecte`S        formData.append('use_llm', aiToggle.c q        console.log('🎚️ AI Toggle:', aiToggle.checked ? 'ON (AI En          
+        try {
+            updateStatus(aiToggle.checked ? 'Processing with AI...' : 'Procesol       ('            :'            
+            const response = await fetch('http://localhost:5000/upload', {
+             is            p                method: 'POST',
+                body: formData
+                            body: formDataalse;
+        }
+    });

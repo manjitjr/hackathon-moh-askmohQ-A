@@ -215,3 +215,61 @@ document.addEventListener('DOMContentLoaded', function() {
         window.URL.revokeObjectURL(url);
     }
 });
+
+// Notification System
+function showNotification(title, message, type = 'info') {
+    const container = document.getElementById('notificationContainer');
+    const notification = document.createElement('div');
+    notification.className = `notification ${type}`;
+    
+    const icons = {
+        success: '✓',
+        error: '✕',
+        warning: '⚠',
+        info: 'ℹ'
+    };
+    
+    notification.innerHTML = `
+        <div class="notification-icon">${icons[type]}</div>
+        <div class="notification-content">
+            <div class="notification-title">${title}</div>
+            <div class="notification-message">${message}</div>
+        </div>
+        <button class="notification-close" onclick="closeNotification(this)">×</button>
+    `;
+    
+    container.appendChild(notification);
+    
+    setTimeout(() => {
+        closeNotification(notification.querySelector('.notification-close'));
+    }, 5000);
+}
+
+function closeNotification(button) {
+    const notification = button.closest('.notification');
+    notification.classList.add('hiding');
+    setTimeout(() => notification.remove(), 300);
+}
+
+function handleApiResponse(response, successMessage) {
+    const statusCode = response.status;
+    
+    if (statusCode >= 200 && statusCode < 300) {
+        showNotification('Success', successMessage || `Request completed (${statusCode})`, 'success');
+        return true;
+    } else if (statusCode === 404) {
+        showNotification('Not Found', 'API endpoint not found (404)', 'error');
+        return false;
+    } else if (statusCode === 500) {
+        showNotification('Server Error', 'Internal server error (500)', 'error');
+        return false;
+    } else if (statusCode >= 400 && statusCode < 500) {
+        showNotification('Request Error', `Client error (${statusCode})`, 'error');
+        return false;
+    } else if (statusCode >= 500) {
+        showNotification('Server Error', `Server error (${statusCode})`, 'error');
+        return false;
+    }
+    
+    return true;
+}
