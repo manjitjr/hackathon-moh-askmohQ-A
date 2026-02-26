@@ -93,6 +93,7 @@ document.addEventListener('DOMContentLoaded', function() {
         resultsSection.style.display = 'none';
         
         updateStatus('Uploading file...', 20);
+        showNotification('Upload Started', 'Processing your Excel file...', 'info');
         
         const formData = new FormData();
         formData.append('file', selectedFile);
@@ -107,7 +108,9 @@ document.addEventListener('DOMContentLoaded', function() {
             });
             
             if (!response.ok) {
-                throw new Error('Upload failed');
+                const errorText = await response.text();
+                handleApiResponse(response);
+                throw new Error(`HTTP ${response.status}: ${errorText.substring(0, 100)}`);
             }
             
             updateStatus('Cleaning and formatting data...', 70);
@@ -116,13 +119,15 @@ document.addEventListener('DOMContentLoaded', function() {
             cleanedData = result;
             
             updateStatus('Complete!', 100);
+            handleApiResponse(response, `Successfully cleaned ${result.total_questions} questions!`);
             
             setTimeout(() => {
                 displayResults(result);
             }, 500);
             
         } catch (error) {
-            alert('Error processing file: ' + error.message + '\n\nMake sure the Flask server is running on port 5000');
+            console.error('Upload error:', error);
+            showNotification('Upload Failed', error.message || 'Make sure the Flask server is running on port 5000', 'error');
             statusSection.style.display = 'none';
             uploadBtn.disabled = false;
         }
