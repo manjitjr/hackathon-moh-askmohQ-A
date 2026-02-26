@@ -34,11 +34,11 @@ document.addEventListener('DOMContentLoaded', function() {
     
     function updateAiStatus() {
         if (aiToggle.checked) {
-            aiStatus.textContent = 'Govtech AIBot (Smart & Secure)';
-            aiStatus.style.color = '#00c853';
+            aiStatus.textContent = 'Govtech AIBot • Smart & Secure';
+            aiStatus.style.color = '#00a651';
         } else {
-            aiStatus.textContent = 'Rule-based (Fast & Free)';
-            aiStatus.style.color = '#666';
+            aiStatus.textContent = 'Rule-based • Fast & Free';
+            aiStatus.style.color = '#7f8c8d';
         }
     }
 
