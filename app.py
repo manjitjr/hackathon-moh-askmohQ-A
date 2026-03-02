@@ -22,21 +22,16 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 # Initialize AIBot API (Govtech)
 USE_LLM = os.getenv('USE_LLM', 'false').lower() == 'true'
 AIBOT_API_KEY = os.getenv('AIBOT_API_KEY')
-AIBOT_API_URL = os.getenv('AIBOT_API_URL', 'https://api.uat.aibots.gov.sg/v1.0/api')
+AIBOT_API_URL = os.getenv('AIBOT_API_URL', 'https://api.uat.aibots.gov.sg/v1.0/api/chats')
 AIBOT_MODEL = os.getenv('AIBOT_MODEL', 'azure~openai.gpt-4o-mini')
+AIBOT_API_MSGS = os.getenv('AIBOT_API_MSGS', '/messages')
+AIBOT_AGENT_ID = os.getenv('AIBOT_AGENT_ID')
 
-if USE_LLM and AIBOT_API_KEY and AIBOT_API_KEY != 'your_api_key_here':
-    aibot_available = True
-    print("✓ LLM features enabled (Govtech AIBot)")
-else:
-    aibot_available = False
-    USE_LLM = False
-    print("✓ Rule-based processing only")
-
-def call_aibot(prompt, max_tokens=150, temperature=0.3):
-    """Call Govtech AIBot API"""
+def setup_aibot(temperature):
+    """Setup AIBot chat"""
     if not aibot_available:
-        return None
+        print("⚠️  AIBot API key not configured. Skipping AIBot setup.")
+        return ""
     
     try:
         headers = {
@@ -44,20 +39,50 @@ def call_aibot(prompt, max_tokens=150, temperature=0.3):
             'Content-Type': 'application/json'
         }
         
-        payload = {
-            'model': AIBOT_MODEL,
-            'messages': [{
-                'role': 'user',
-                'content': prompt
-            }],
-            'max_tokens': max_tokens,
-            'temperature': temperature
+        payload ={
+            "agents": [AIBOT_AGENT_ID],
+            "model": AIBOT_MODEL,
+            "name": "QA Cleaner Test",
+            "params": {"temperature": temperature}
         }
         
-        response = requests.post(AIBOT_API_URL, headers=headers, json=payload, timeout=30)
+        response = requests.post(AIBOT_API_URL, headers=headers, json=payload, timeout=10)
         response.raise_for_status()
         
         result = response.json()
+        print(f"AIBot setup test successful: {result}")
+        return result.get('id')
+    except Exception as e:
+        print(f"AIBot setup test failed: {e}")
+        return ""
+    
+if USE_LLM and AIBOT_API_KEY and AIBOT_API_KEY != 'your_api_key_here':
+    aibot_available = True
+    chat_id = setup_aibot(temperature=0.3)
+    print("✓ LLM features enabled (Govtech AIBot), chatID = ", chat_id)
+else:
+    aibot_available = False
+    USE_LLM = False
+    print("✓ Rule-based processing only")
+
+def call_aibot(prompt):
+    """Call Govtech AIBot Message API"""
+    if not aibot_available:
+        return None
+    
+    try:
+        msg_url = AIBOT_API_URL +  "/" + chat_id + AIBOT_API_MSGS
+
+        response = requests.post(
+            msg_url,
+            headers={"X-ATLAS-Key": AIBOT_API_KEY},
+            data={"content": prompt}
+        )
+        response.raise_for_status()
+
+        result = response.json()
+        
+        print(f"AIBot result: {result}")
         # Parse AIBot response format
         if 'choices' in result and len(result['choices']) > 0:
             return result['choices'][0]['message']['content'].strip()
@@ -67,7 +92,17 @@ def call_aibot(prompt, max_tokens=150, temperature=0.3):
             return result.strip()
         return None
     except Exception as e:
-        print(f"AIBot API error: {e}")
+        # Try to extract API error details if present
+        try:
+            err_body = None
+            if 'response' in locals() and response is not None:
+                try:
+                    err_body = response.json()
+                except Exception:
+                    err_body = response.text
+            print(f"AIBot API error: {e}; response body: {err_body}")
+        except Exception:
+            print(f"AIBot API error: {e}")
         return None
 
 def remove_sensitive_info(text):
@@ -121,7 +156,7 @@ def rephrase_question(question, use_llm_for_request=None):
 Rephrase this question: {question}
 
 Respond with only the rephrased question."""
-                rephrased = call_aibot(prompt, max_tokens=100, temperature=0.3)
+                rephrased = call_aibot(prompt)
                 if rephrased and rephrased.endswith('?'):
                     return rephrased
             except Exception as e:
@@ -198,7 +233,7 @@ Are these questions essentially the same?
 2: {q2}
 
 Respond with only 'yes' or 'no'."""
-                answer = call_aibot(prompt, max_tokens=5, temperature=0)
+                answer = call_aibot(prompt)
                 if answer:
                     return 'yes' in answer.lower()
             except Exception as e:
@@ -282,7 +317,7 @@ def clean_qa_data(df, use_llm_override=None):
 Categorize this question: {question}
 
 Respond with ONLY the category name."""
-                category = call_aibot(prompt, max_tokens=20, temperature=0)
+                category = call_aibot(prompt)
                 if not category:
                     category = "General"
             except Exception as e:
@@ -311,6 +346,7 @@ Respond with ONLY the category name."""
             stats['sensitive_info_removed'] += 1
         
         # Rephrase question for standardization
+        print(f"USIING LLM: {use_llm_for_this_request}")
         rephrased_question = rephrase_question(question, use_llm_for_this_request)
         if rephrased_question != question:
             stats['questions_rephrased'] += 1
