@@ -199,14 +199,21 @@ document.addEventListener('DOMContentLoaded', function() {
                 body: JSON.stringify(cleanedData.cleaned_data)
             });
             
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+            }
+            
             const blob = await response.blob();
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
             a.download = 'cleaned_qa_data.xlsx';
             a.click();
+            window.URL.revokeObjectURL(url);
+            showNotification('Download Complete', 'Excel file downloaded successfully', 'success');
         } catch (error) {
-            alert('Error downloading Excel file: ' + error.message);
+            console.error('Download error:', error);
+            showNotification('Download Failed', error.message, 'error');
         }
     });
 
