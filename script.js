@@ -102,10 +102,12 @@ document.addEventListener('DOMContentLoaded', function() {
                 try {
             updateStatus(aiToggle.checked ? 'Processing with AI...' : 'Processing Excel file...', 40);
             
+            console.log('🚀 Sending upload request...');
             const response = await fetch('http://localhost:5000/upload', {
                 method: 'POST',
                 body: formData
             });
+            console.log('📥 Response received:', response.status, response.statusText);
             
             if (!response.ok) {
                 const errorText = await response.text();
@@ -115,18 +117,23 @@ document.addEventListener('DOMContentLoaded', function() {
             
             updateStatus('Cleaning and formatting data...', 70);
             
+            console.log('📊 Parsing JSON response...');
             const result = await response.json();
+            console.log('✅ Result:', result);
             cleanedData = result;
             
             updateStatus('Complete!', 100);
+            console.log('🎉 About to call handleApiResponse and displayResults');
             handleApiResponse(response, `Successfully cleaned ${result.total_questions} questions!`);
             
             setTimeout(() => {
+                console.log('🖼️ Calling displayResults with:', result);
                 displayResults(result);
             }, 500);
             
         } catch (error) {
-            console.error('Upload error:', error);
+            console.error('❌ Upload error:', error);
+            console.error('Error stack:', error.stack);
             showNotification('Upload Failed', error.message || 'Make sure the Flask server is running on port 5000', 'error');
             statusSection.style.display = 'none';
             uploadBtn.disabled = false;
