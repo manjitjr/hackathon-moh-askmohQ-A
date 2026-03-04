@@ -6,9 +6,24 @@ import io
 from werkzeug.utils import secure_filename
 import os
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import requests
 import json
 from dotenv import load_dotenv
+ 
+def _parse_possible_json(s):
+    """If `s` is a JSON-looking string, attempt to parse and return Python object; otherwise return original."""
+    if not isinstance(s, str):
+        return s
+    s_stripped = s.strip()
+    if not s_stripped:
+        return s
+    if (s_stripped.startswith('{') or s_stripped.startswith('[')):
+        try:
+            return json.loads(s_stripped)
+        except Exception:
+            return s
+    return s
 
 # Load environment variables
 load_dotenv()
@@ -81,16 +96,10 @@ def call_aibot(prompt):
         response.raise_for_status()
 
         result = response.json()
+        print(f"AIBot result: {result['response']['content']}")
         
-        print(f"AIBot result: {result}")
-        # Parse AIBot response format
-        if 'choices' in result and len(result['choices']) > 0:
-            return result['choices'][0]['message']['content'].strip()
-        elif 'response' in result:
-            return result['response'].strip()
-        elif isinstance(result, str):
-            return result.strip()
-        return None
+        return result['response']['content']
+
     except Exception as e:
         # Try to extract API error details if present
         try:
@@ -151,14 +160,11 @@ def rephrase_question(question, use_llm_for_request=None):
     if use_llm_now:
         if aibot_available:
             try:
-                prompt = f"""You are a medical Q&A standardizer. Rephrase questions to be generic, professional, and suitable for a healthcare knowledge base. Remove personal pronouns. Keep questions concise.
-
-Rephrase this question: {question}
-
-Respond with only the rephrased question."""
-                rephrased = call_aibot(prompt)
-                if rephrased and rephrased.endswith('?'):
-                    return rephrased
+                rephrased = call_aibot(question)
+                rephrased = _parse_possible_json(rephrased)
+                # if rephrased and rephrased.endswith('?'):
+                #     print(f"LLM rephrased question: {rephrased}")
+                #     return rephrased
             except Exception as e:
                 print(f"AIBot error: {e}, falling back to rules")
         else:
@@ -275,29 +281,19 @@ def clean_qa_data(df, use_llm_override=None):
     # Try to identify question, answer, and category columns
     columns = df.columns.tolist()
     question_col = None
-    answer_col = None
-    category_col = None
     
     # Look for question, answer, and category columns
     for col in columns:
         col_lower = str(col).lower()
         if 'question' in col_lower or 'q' == col_lower:
             question_col = col
-        elif 'answer' in col_lower or 'a' == col_lower or 'ans' in col_lower:
-            answer_col = col
-        elif 'topic' in col_lower or 'category' in col_lower or 'cat' in col_lower or 'subject' in col_lower:
-            category_col = col
     
     # If not found, use first columns
     if question_col is None and len(columns) > 0:
         question_col = columns[0]
-    if answer_col is None and len(columns) > 1:
-        answer_col = columns[1]
-    if category_col is None and len(columns) > 2:
-        category_col = columns[2]
     
-    if question_col is None or answer_col is None:
-        raise ValueError("Could not identify question and answer columns")
+    if question_col is None:
+        raise ValueError("Could not identify question column")
     
     # Create new dataframe with cleaned data
     cleaned_data = []
@@ -305,72 +301,188 @@ def clean_qa_data(df, use_llm_override=None):
     
     for idx, row in df.iterrows():
         question = clean_text(row[question_col])
-        answer = clean_text(row[answer_col])
-        
-        # Get category or auto-categorize using LLM if enabled
-        if category_col and category_col in df.columns and pd.notna(row[category_col]):
-            category = clean_text(row[category_col])
-        elif use_llm_for_this_request and aibot_available:
-            try:
-                prompt = f"""You are a medical topic categorizer. Respond with only ONE category from: Fever Management, Chronic Conditions, Diabetes, Cardiac Health, Infectious Diseases, Medication, Pain Management, First Aid, Pediatrics, Mental Health, Nutrition, Vaccinations, or General.
-
-Categorize this question: {question}
-
-Respond with ONLY the category name."""
-                category = call_aibot(prompt)
-                if not category:
-                    category = "General"
-            except Exception as e:
-                category = "General"
-        else:
-            category = "General"
         
         # Skip empty rows
-        if not question or not answer:
+        if not question:
             stats['issues_fixed'] += 1
             continue
         
-        # Skip very short questions/answers
-        if len(question) < 3 or len(answer) < 3:
+        # Skip very short questions
+        if len(question) < 3:
             stats['issues_fixed'] += 1
             continue
         
-        # Remove sensitive information from both question and answer
+        # Remove sensitive information from question
         original_question = question
-        original_answer = answer
         
         question = remove_sensitive_info(question)
-        answer = remove_sensitive_info(answer)
         
-        if question != original_question or answer != original_answer:
+        if question != original_question:
             stats['sensitive_info_removed'] += 1
         
         # Rephrase question for standardization
-        print(f"USIING LLM: {use_llm_for_this_request}")
-        rephrased_question = rephrase_question(question, use_llm_for_this_request)
-        if rephrased_question != question:
-            stats['questions_rephrased'] += 1
-            question = rephrased_question
-        
+        if use_llm_for_this_request:
+            rephrased_question = _parse_possible_json(call_aibot(question))
+        else: 
+            rephrased_question = rephrase_question(question, use_llm_for_this_request)
+        # if isinstance(rephrased_question, dict):
+        #     # If LLM returned structured JSON, try to extract a text field
+        #     for k in ('question', 'rephrased', 'text', 'content'):
+        #         if k in rephrased_question and isinstance(rephrased_question[k], str):
+        #             rephrased_question = rephrased_question[k]
+        #             break
+        #     else:
+        #         # fallback to original question
+        #         rephrased_question = question
+
+        # if rephrased_question != question:
+        #     stats['questions_rephrased'] += 1
+        #     question = rephrased_question
+
+        # print(f"Processed question: {question}")
+
         # Check for similar questions (more aggressive duplicate detection)
-        is_duplicate = False
-        for seen_q in seen_questions:
-            if is_similar_question(question, seen_q, 0.8, use_llm_for_this_request):
-                is_duplicate = True
-                stats['duplicates_removed'] += 1
-                break
+        # is_duplicate = False
+        # for seen_q in seen_questions:
+        #     if is_similar_question(question, seen_q, 0.8, use_llm_for_this_request):
+        #         is_duplicate = True
+        #         stats['duplicates_removed'] += 1
+        #         break
         
-        if is_duplicate:
-            continue
-        
+        # if is_duplicate:
+        #     continue
         seen_questions.append(question)
+        # Attempt to extract category and answer columns if present
+
         cleaned_data.append({
-            'category': category,
-            'question': question,
-            'answer': answer
+            'category': rephrased_question['category'],
+            'question': rephrased_question['question'],
+            'answer': rephrased_question['answer'],
+            'confidence': rephrased_question['confidence']['level'],
+            'reason': rephrased_question['confidence']['reason'],
         })
+        # cleaned_data.append(rephrased_question)
     
     return cleaned_data, stats
+
+def save_database_excel(cleaned_data):
+    """Save cleaned data to a database Excel file (append or create)."""
+    filename = 'database.xlsx'
+    # Ensure list of dicts
+    try:
+        new_data = pd.DataFrame(cleaned_data)
+    except Exception:
+        # If cleaned_data is not a list of dicts, attempt to normalize
+        new_data = pd.DataFrame([item if isinstance(item, dict) else {'question': str(item)} for item in cleaned_data])
+
+    # Add timestamp column for when these rows were saved (Singapore timezone)
+    try:
+        if ZoneInfo is not None:
+            sg_tz = ZoneInfo('Asia/Singapore')
+            timestamp = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %Z')
+        else:
+            # Fallback: use UTC+8 offset if zoneinfo not available
+            from datetime import timezone, timedelta
+            sg_tz = timezone(timedelta(hours=8))
+            timestamp = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %z')
+    except Exception:
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # Ensure there's a 'question' column we can use to detect duplicates
+    if 'question' not in new_data.columns:
+        # try to find a column that looks like a question
+        for c in new_data.columns:
+            if str(c).lower().startswith('q') or 'question' in str(c).lower():
+                new_data = new_data.rename(columns={c: 'question'})
+                break
+
+    # Fill NA and coerce to string for comparison
+    if 'question' in new_data.columns:
+        new_data['question'] = new_data['question'].fillna('').astype(str)
+    else:
+        # Nothing sensible to save
+        print('No question column found in cleaned data; aborting save.')
+        return
+
+    # Add timestamp only for new rows (will be set on rows that are appended)
+    new_data['date_time'] = ''
+
+    def _normalize_text(s: str) -> str:
+        if s is None:
+            return ''
+        s = str(s).strip().lower()
+        # remove punctuation and extra spaces
+        s = re.sub(r'[\W_]+', ' ', s)
+        s = re.sub(r'\s+', ' ', s).strip()
+        return s
+
+    # If file exists, read existing questions and filter out duplicates
+    if os.path.exists(filename):
+        try:
+            existing_data = pd.read_excel(filename)
+            # collect normalized existing questions from likely columns
+            existing_questions = set()
+            for col in ('question', 'original_question'):
+                if col in existing_data.columns:
+                    existing_data[col] = existing_data[col].fillna('').astype(str)
+                    existing_questions.update(_normalize_text(x) for x in existing_data[col].tolist())
+
+            # Determine rows to append (those whose normalized question is not in existing_questions)
+            to_append_rows = []
+            for _, row in new_data.iterrows():
+                nq = _normalize_text(row.get('question', ''))
+                if nq and nq not in existing_questions:
+                    # set timestamp for this appended row
+                    try:
+                        if ZoneInfo is not None:
+                            sg_tz = ZoneInfo('Asia/Singapore')
+                            row_ts = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %Z')
+                        else:
+                            from datetime import timezone, timedelta
+                            sg_tz = timezone(timedelta(hours=8))
+                            row_ts = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %z')
+                    except Exception:
+                        row_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    row = row.copy()
+                    row['date_time'] = row_ts
+                    to_append_rows.append(row)
+                else:
+                    # duplicate detected; skip
+                    pass
+
+            if not to_append_rows:
+                print('No new (non-duplicate) questions to append to', filename)
+                return
+
+            to_append_df = pd.DataFrame(to_append_rows)
+
+            # Combine and save
+            combined_data = pd.concat([existing_data, to_append_df], ignore_index=True)
+            combined_data.to_excel(filename, index=False)
+            print(f'Appended {len(to_append_df)} new rows to {filename}')
+
+        except Exception as e:
+            print(f"Error appending to {filename}: {e}")
+            # fallback: write only the new non-duplicate rows
+            try:
+                new_data.to_excel(filename, index=False)
+            except Exception as e2:
+                print(f"Failed to write fallback {filename}: {e2}")
+    else:
+        # New file: set timestamp for all rows
+        try:
+            if ZoneInfo is not None:
+                sg_tz = ZoneInfo('Asia/Singapore')
+                row_ts = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %Z')
+            else:
+                from datetime import timezone, timedelta
+                sg_tz = timezone(timedelta(hours=8))
+                row_ts = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %z')
+        except Exception:
+            row_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        new_data['date_time'] = row_ts
+        new_data.to_excel(filename, index=False)
+
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -400,6 +512,15 @@ def upload_file():
         
         # Clean the data with AI override
         cleaned_data, stats = clean_qa_data(df, use_llm_override)
+        print(f"Cleaning stats: {cleaned_data}")
+        print(f"Cleaning stats: {stats}")
+
+        # Persist cleaned results to local database.xlsx (append)
+        try:
+            save_database_excel(cleaned_data)
+            print('Saved cleaned data to database.xlsx')
+        except Exception as e:
+            print(f'Warning: failed to save cleaned data to database.xlsx: {e}')
         
         return jsonify({
             'success': True,

@@ -37,7 +37,7 @@ AIBOT_API_KEY=your_api_key_here
 AIBOT_API_URL="https://api.uat.aibots.gov.sg/v1.0/api/chats"
 AIBOT_MODEL="llm_model_name"
 AIBOT_API_MSGS="/messages"
-AIBOT_AGENT_ID="chatbot_agent_id"
+AIBOT_AGENT_ID="your_chatbot_agent_id"
 ```
 
 3. Start the servers:

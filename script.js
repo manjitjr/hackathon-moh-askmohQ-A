@@ -166,6 +166,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 <td><span class="category-badge">${item.category || 'General'}</span></td>
                 <td>${item.question}</td>
                 <td>${item.answer}</td>
+                <td>${item.confidence}</td>
+                <td>${item.reason}</td>
             `;
             previewBody.appendChild(row);
         });
@@ -186,7 +188,7 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('downloadCsvBtn').addEventListener('click', () => {
         if (!cleanedData) return;
         
-        let csv = 'Category,Question,Answer\n';
+        let csv = 'Category,Question,Answer,Confidence,Reason\n';
         cleanedData.cleaned_data.forEach(item => {
             csv += `"${(item.category || 'General').replace(/"/g, '""')}","${item.question.replace(/"/g, '""')}","${item.answer.replace(/"/g, '""')}"\n`;
         });
