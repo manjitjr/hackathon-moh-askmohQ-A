@@ -17,6 +17,9 @@ uploads/
 *.xls
 *.csv
 
+# Database file
+database.xlsx
+
 # OS files
 .DS_Store
 Thumbs.db

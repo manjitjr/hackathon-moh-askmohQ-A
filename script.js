@@ -34,11 +34,11 @@ document.addEventListener('DOMContentLoaded', function() {
     
     function updateAiStatus() {
         if (aiToggle.checked) {
-            aiStatus.textContent = 'Govtech AIBot • Smart & Secure';
-            aiStatus.style.color = '#00a651';
+            aiStatus.textContent = 'Govtech AIBot';
+            aiStatus.style.color = '#667eea';
         } else {
             aiStatus.textContent = 'Rule-based • Fast & Free';
-            aiStatus.style.color = '#7f8c8d';
+            aiStatus.style.color = '#64748b';
         }
     }
 
@@ -84,7 +84,7 @@ document.addEventListener('DOMContentLoaded', function() {
         uploadBtn.disabled = false;
     }
 
-    // Upload and process
+    // Upload and process with streaming
     uploadBtn.addEventListener('click', async () => {
         if (!selectedFile) return;
         
@@ -92,44 +92,87 @@ document.addEventListener('DOMContentLoaded', function() {
         statusSection.style.display = 'block';
         resultsSection.style.display = 'none';
         
+        // Clear previous results
+        const previewBody = document.getElementById('previewBody');
+        if (previewBody) {
+            previewBody.innerHTML = '';
+        }
+        
         updateStatus('Uploading file...', 20);
         showNotification('Upload Started', 'Processing your Excel file...', 'info');
         
         const formData = new FormData();
         formData.append('file', selectedFile);
         formData.append('use_llm', aiToggle.checked ? 'true' : 'false');
-                console.log('🎚️ AI Toggle:', aiToggle.checked ? 'ON (AI Enabled)' : 'OFF (Rule-based)');
-                try {
-            updateStatus(aiToggle.checked ? 'Processing with AI...' : 'Processing Excel file...', 40);
-            
-            console.log('🚀 Sending upload request...');
-            const response = await fetch('http://localhost:5000/upload', {
+        console.log('🎚️ AI Toggle:', aiToggle.checked ? 'ON (AI Enabled)' : 'OFF (Rule-based)');
+        
+        try {
+            // Use fetch with streaming
+            const response = await fetch('http://localhost:5000/upload/stream', {
                 method: 'POST',
                 body: formData
             });
-            console.log('📥 Response received:', response.status, response.statusText);
             
             if (!response.ok) {
-                const errorText = await response.text();
-                handleApiResponse(response);
-                throw new Error(`HTTP ${response.status}: ${errorText.substring(0, 100)}`);
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
             
-            updateStatus('Cleaning and formatting data...', 70);
+            // Process SSE stream
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let totalQuestions = 0;
+            let processedData = [];
+            let finalStats = null;
             
-            console.log('📊 Parsing JSON response...');
-            const result = await response.json();
-            console.log('✅ Result:', result);
-            cleanedData = result;
-            
-            updateStatus('Complete!', 100);
-            console.log('🎉 About to call handleApiResponse and displayResults');
-            handleApiResponse(response, `Successfully cleaned ${result.total_questions} questions!`);
-            
-            setTimeout(() => {
-                console.log('🖼️ Calling displayResults with:', result);
-                displayResults(result);
-            }, 500);
+            while (true) {
+                const {done, value} = await reader.read();
+                
+                if (done) break;
+                
+                buffer += decoder.decode(value, {stream: true});
+                const lines = buffer.split('\\n\\n');
+                buffer = lines.pop() || '';
+                
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        const data = JSON.parse(line.slice(6));
+                        
+                        if (data.type === 'start') {
+                            totalQuestions = data.total;
+                            updateStatus(`Processing ${totalQuestions} questions...`, 30);
+                        } else if (data.type === 'progress') {
+                            // Update progress bar
+                            const progress = 30 + (data.percentage * 0.6); // Scale to 30-90%
+                            updateStatus(`Processing question ${data.index} of ${data.total}...`, progress);
+                            
+                            // Add row to table in real-time
+                            processedData.push(data.data);
+                            addRowToTable(data.data, data.index);
+                            
+                            // Show results section if not already visible
+                            if (resultsSection.style.display === 'none') {
+                                resultsSection.style.display = 'block';
+                            }
+                        } else if (data.type === 'complete') {
+                            cleanedData = {
+                                cleaned_data: data.cleaned_data,
+                                total_questions: data.total_questions,
+                                ...data.stats
+                            };
+                            finalStats = data.stats;
+                            updateStatus('Complete!', 100);
+                            
+                            // Update stats display
+                            updateStatsDisplay(cleanedData);
+                            
+                            handleApiResponse(response, `Successfully cleaned ${data.total_questions} questions!`);
+                        } else if (data.type === 'error') {
+                            throw new Error(data.message);
+                        }
+                    }
+                }
+            }
             
         } catch (error) {
             console.error('❌ Upload error:', error);
@@ -143,6 +186,45 @@ document.addEventListener('DOMContentLoaded', function() {
     function updateStatus(message, progress) {
         statusMessage.textContent = message;
         progressFill.style.width = progress + '%';
+        
+        // Update percentage display
+        const percentageDisplay = document.getElementById('percentageDisplay');
+        if (percentageDisplay) {
+            percentageDisplay.textContent = Math.round(progress) + '%';
+            percentageDisplay.style.animation = 'none';
+            setTimeout(() => {
+                percentageDisplay.style.animation = 'scaleIn 0.3s ease-out';
+            }, 10);
+        }
+    }
+
+    function addRowToTable(item, index) {
+        const previewBody = document.getElementById('previewBody');
+        const row = document.createElement('tr');
+        row.className = 'fade-in-row';
+        row.innerHTML = `
+            <td>${index}</td>
+            <td><span class="category-badge">${item.category || 'General'}</span></td>
+            <td>${item.question}</td>
+            <td>${item.answer}</td>
+            <td>${item.confidence}</td>
+            <td>${item.reason}</td>
+        `;
+        previewBody.appendChild(row);
+        
+        // Scroll to bottom to show new row
+        const previewTable = document.querySelector('.preview-table');
+        if (previewTable) {
+            previewTable.scrollTop = previewTable.scrollHeight;
+        }
+    }
+    
+    function updateStatsDisplay(data) {
+        document.getElementById('totalQuestions').textContent = data.total_questions;
+        document.getElementById('removedDuplicates').textContent = data.duplicates_removed;
+        document.getElementById('fixedIssues').textContent = data.issues_fixed;
+        document.getElementById('sensitiveInfo').textContent = data.sensitive_info_removed || 0;
+        document.getElementById('rephrased').textContent = data.questions_rephrased || 0;
     }
 
     function displayResults(data) {

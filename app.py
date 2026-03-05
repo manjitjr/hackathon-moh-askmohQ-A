@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response, stream_with_context
 from flask_cors import CORS
 import pandas as pd
 import re
@@ -140,7 +140,13 @@ def call_aibot(prompt):
             app.logger.info(f"✅ Parsed Answer: {answer}")
             return answer
         elif 'response' in result:
-            answer = result['response'].strip()
+            # Handle both string and dict formats
+            if isinstance(result['response'], dict) and 'content' in result['response']:
+                answer = result['response']['content'].strip()
+            elif isinstance(result['response'], str):
+                answer = result['response'].strip()
+            else:
+                answer = str(result['response']).strip()
             app.logger.info(f"✅ Parsed Answer: {answer}")
             return answer
         elif isinstance(result, str):
@@ -209,12 +215,16 @@ def rephrase_question(question, use_llm_for_request=None):
     
     # Use LLM if enabled (check override or global setting)
     use_llm_now = use_llm_for_request if use_llm_for_request is not None else USE_LLM
+    
+    app.logger.info(f"🔍 Processing question: '{question[:80]}...' | AI Mode: {use_llm_now}")
+    
     if use_llm_now:
         if aibot_available:
             # Check local database for an existing entry and reuse it if available
             try:
                 existing = find_existing_entry_by_question(question)
                 if existing:
+                    app.logger.info(f"♻️ Found existing entry in database, reusing it")
                     # Build a rephrased_question dict matching expected schema
                     rephrased = {
                         'category': existing.get('category', ''),
@@ -223,16 +233,55 @@ def rephrase_question(question, use_llm_for_request=None):
                         'confidence': {'level': existing.get('confidence', ''), 'reason': existing.get('reason', '')}
                     }
                     return rephrased
-            except Exception:
-                pass
+                else:
+                    app.logger.info(f"🆕 No existing entry found, calling AIBot...")
+            except Exception as e:
+                app.logger.warning(f"⚠️ Database lookup error: {e}")
 
             try:
-                rephrased = call_aibot(question)
-                rephrased = _parse_possible_json(rephrased)
+                # Create a structured prompt for the AIBot
+                prompt = f"""Analyze this healthcare question and provide a structured response in JSON format:
+
+Question: "{question}"
+
+Please provide:
+1. A categorized topic (e.g., "General Healthcare", "Medication", "Symptoms", "Treatment", "Prevention")
+2. A standardized, generic version of the question (remove personal details, make it general)
+3. A brief, accurate answer to the question
+4. Your confidence level (High/Medium/Low) and reason
+
+Respond ONLY with valid JSON in this exact format:
+{{
+  "category": "Category Name",
+  "question": "Standardized generic question?",
+  "answer": "Brief accurate answer",
+  "confidence": {{
+    "level": "High/Medium/Low",
+    "reason": "Brief explanation"
+  }}
+}}"""
+                
+                app.logger.info(f"📤 Calling AIBot for question: {question[:100]}...")
+                rephrased = call_aibot(prompt)
+                
+                if rephrased:
+                    rephrased = _parse_possible_json(rephrased)
+                    app.logger.info(f"✅ AIBot response received: {str(rephrased)[:200]}...")
+                    
+                    # Ensure it's in the correct format
+                    if isinstance(rephrased, dict):
+                        return rephrased
+                    else:
+                        app.logger.warning(f"⚠️ AIBot response not in expected format, using fallback")
+                else:
+                    app.logger.warning(f"⚠️ No response from AIBot, using fallback")
+                    
             except Exception as e:
-                app.logger.error(f"AIBot error: {e}, falling back to rules")
+                app.logger.error(f"❌ AIBot error: {e}, falling back to rules")
         else:
             app.logger.warning("⚠️  AI requested but AIBot API key not configured. Using rule-based processing.")
+    else:
+        app.logger.info(f"📝 Using rule-based processing (AI Mode OFF)")
     
     # Fallback to rule-based rephrasing
     # Convert to lowercase for pattern matching
@@ -266,7 +315,13 @@ def rephrase_question(question, use_llm_for_request=None):
     if rephrased and not rephrased.endswith('?'):
         rephrased += '?'
     
-    return rephrased
+    # Return structured format matching LLM response
+    return {
+        'category': 'General Healthcare',
+        'question': rephrased,
+        'answer': '',
+        'confidence': {'level': 'Low', 'reason': 'Rule-based processing without LLM analysis'}
+    }
 
 def clean_text(text):
     """Clean and normalize text"""
@@ -329,6 +384,90 @@ Respond with only 'yes' or 'no'."""
     similarity = intersection / union if union > 0 else 0
     return similarity >= threshold
 
+def clean_qa_data_stream(df, use_llm_override=None):
+    """Generator function that yields progress for each Q&A processed"""
+    # Determine if we should use LLM (override takes precedence)
+    use_llm_for_this_request = use_llm_override if use_llm_override is not None else USE_LLM
+    
+    stats = {
+        'original_count': len(df),
+        'duplicates_removed': 0,
+        'issues_fixed': 0,
+        'sensitive_info_removed': 0,
+        'questions_rephrased': 0
+    }
+    
+    # Try to identify question column
+    columns = df.columns.tolist()
+    question_col = None
+    
+    for col in columns:
+        col_lower = str(col).lower()
+        if 'question' in col_lower or 'q' == col_lower:
+            question_col = col
+    
+    if question_col is None and len(columns) > 0:
+        question_col = columns[0]
+    
+    if question_col is None:
+        raise ValueError("Could not identify question column")
+    
+    seen_questions = []
+    total_rows = len(df)
+    
+    for idx, row in df.iterrows():
+        question = clean_text(row[question_col])
+        
+        # Skip empty or very short questions
+        if not question or len(question) < 3:
+            stats['issues_fixed'] += 1
+            continue
+        
+        # Remove sensitive information
+        original_question = question
+        question = remove_sensitive_info(question)
+        
+        if question != original_question:
+            stats['sensitive_info_removed'] += 1
+        
+        # Rephrase question
+        rephrased_result = rephrase_question(question, use_llm_for_this_request)
+        
+        # Handle both dict and string responses
+        if isinstance(rephrased_result, dict):
+            rephrased_question = rephrased_result.get('question', question)
+        else:
+            rephrased_question = rephrased_result
+            rephrased_result = {
+                'category': 'General Healthcare',
+                'question': rephrased_question,
+                'answer': '',
+                'confidence': {'level': 'Low', 'reason': 'Rule-based processing'}
+            }
+        
+        if rephrased_question != question:
+            stats['questions_rephrased'] += 1
+        
+        seen_questions.append(question)
+        
+        cleaned_item = {
+            'category': rephrased_result.get('category', 'General Healthcare'),
+            'question': rephrased_result.get('question', rephrased_question),
+            'answer': rephrased_result.get('answer', ''),
+            'confidence': rephrased_result.get('confidence', {}).get('level', 'Low'),
+            'reason': rephrased_result.get('confidence', {}).get('reason', ''),
+        }
+        
+        # Yield progress update
+        yield {
+            'type': 'progress',
+            'index': idx + 1,
+            'total': total_rows,
+            'percentage': int(((idx + 1) / total_rows) * 100),
+            'data': cleaned_item,
+            'stats': stats.copy()
+        }
+
 def clean_qa_data(df, use_llm_override=None):
     """Clean and process healthcare Q&A data"""
     # Determine if we should use LLM (override takes precedence)
@@ -386,10 +525,23 @@ def clean_qa_data(df, use_llm_override=None):
         
         # Rephrase question for standardization
         app.logger.info(f"USING LLM: {use_llm_for_this_request}")
-        rephrased_question = rephrase_question(question, use_llm_for_this_request)
+        rephrased_result = rephrase_question(question, use_llm_for_this_request)
+        
+        # Handle both dict (LLM/structured) and string (fallback) responses
+        if isinstance(rephrased_result, dict):
+            rephrased_question = rephrased_result.get('question', question)
+        else:
+            # Old format - shouldn't happen now but keep for safety
+            rephrased_question = rephrased_result
+            rephrased_result = {
+                'category': 'General Healthcare',
+                'question': rephrased_question,
+                'answer': '',
+                'confidence': {'level': 'Low', 'reason': 'Rule-based processing'}
+            }
+        
         if rephrased_question != question:
             stats['questions_rephrased'] += 1
-            question = rephrased_question
         
         # Check for similar questions (more aggressive duplicate detection)
         # is_duplicate = False
@@ -405,11 +557,11 @@ def clean_qa_data(df, use_llm_override=None):
         # Attempt to extract category and answer columns if present
 
         cleaned_data.append({
-            'category': rephrased_question['category'],
-            'question': rephrased_question['question'],
-            'answer': rephrased_question['answer'],
-            'confidence': rephrased_question['confidence']['level'],
-            'reason': rephrased_question['confidence']['reason'],
+            'category': rephrased_result.get('category', 'General Healthcare'),
+            'question': rephrased_result.get('question', rephrased_question),
+            'answer': rephrased_result.get('answer', ''),
+            'confidence': rephrased_result.get('confidence', {}).get('level', 'Low'),
+            'reason': rephrased_result.get('confidence', {}).get('reason', ''),
         })
         # cleaned_data.append(rephrased_question)
     
@@ -686,6 +838,70 @@ def upload_file():
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/upload/stream', methods=['POST'])
+def upload_file_stream():
+    """Stream processing results in real-time using Server-Sent Events"""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    
+    file = request.files['file']
+    
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    if not file.filename.endswith(('.xlsx', '.xls')):
+        return jsonify({'error': 'Invalid file type. Please upload an Excel file'}), 400
+    
+    # Get AI toggle setting from request
+    use_llm_override = request.form.get('use_llm', 'false').lower() == 'true'
+    
+    # Read Excel file BEFORE creating generator (to avoid closed file issue)
+    try:
+        df = pd.read_excel(file)
+    except Exception as e:
+        return jsonify({'error': f'Failed to read Excel file: {str(e)}'}), 400
+    
+    def generate():
+        try:
+            total_rows = len(df)
+            
+            yield f"data: {json.dumps({'type': 'start', 'total': total_rows})}\\n\\n"
+            
+            # Process with streaming
+            cleaned_data = []
+            stats = {
+                'original_count': total_rows,
+                'duplicates_removed': 0,
+                'issues_fixed': 0,
+                'sensitive_info_removed': 0,
+                'questions_rephrased': 0
+            }
+            
+            for result in clean_qa_data_stream(df, use_llm_override):
+                if result['type'] == 'progress':
+                    cleaned_data.append(result['data'])
+                    # Update stats
+                    if result.get('stats'):
+                        stats.update(result['stats'])
+                    
+                    # Send progress update
+                    yield f"data: {json.dumps(result)}\\n\\n"
+            
+            # Save to database
+            try:
+                save_database_excel(df, cleaned_data)
+            except Exception as e:
+                app.logger.error(f'Failed to save to database: {e}')
+            
+            # Send completion
+            yield f"data: {json.dumps({'type': 'complete', 'cleaned_data': cleaned_data, 'stats': stats, 'total_questions': len(cleaned_data)})}\\n\\n"
+            
+        except Exception as e:
+            app.logger.error(f"Streaming error: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\\n\\n"
+    
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
 @app.route('/download/excel', methods=['POST'])
 def download_excel():
