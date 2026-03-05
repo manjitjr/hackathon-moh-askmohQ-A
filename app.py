@@ -9,12 +9,20 @@ from zoneinfo import ZoneInfo
 import requests
 import json
 from dotenv import load_dotenv
- 
+from logging_config import setup_logging
+import urllib3
+
+# Disable SSL warnings for self-signed certificates
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
+
+# Setup logging
+setup_logging(app)
 
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -33,7 +41,7 @@ sg_tz = ZoneInfo('Asia/Singapore')
 def setup_aibot(temperature):
     """Setup AIBot chat"""
     if not aibot_available:
-        print("⚠️  AIBot API key not configured. Skipping AIBot setup.")
+        app.logger.warning("⚠️  AIBot API key not configured. Skipping AIBot setup.")
         return ""
     
     try:
@@ -49,24 +57,46 @@ def setup_aibot(temperature):
             "params": {"temperature": temperature}
         }
         
-        response = requests.post(AIBOT_API_URL, headers=headers, json=payload, timeout=10)
+        # Log chat setup request
+        app.logger.info("="*60)
+        app.logger.info("🔧 AIBot Chat Setup Request")
+        app.logger.info(f"URL: {AIBOT_API_URL}")
+        app.logger.info(f"Model: {AIBOT_MODEL}")
+        app.logger.info(f"Agent ID: {AIBOT_AGENT_ID}")
+        app.logger.info(f"Temperature: {temperature}")
+        app.logger.info("="*60)
+        
+        response = requests.post(AIBOT_API_URL, headers=headers, json=payload, timeout=10, verify=False)
+        
+        app.logger.info(f"📡 Setup Response Status: {response.status_code}")
+        
         response.raise_for_status()
         
         result = response.json()
-        print(f"AIBot setup test successful: {result}")
-        return result.get('id')
+        chat_id = result.get('id')
+        
+        app.logger.info("="*60)
+        app.logger.info("✅ AIBot Chat Setup Successful")
+        app.logger.info(f"Chat ID: {chat_id}")
+        app.logger.info(f"Full Response: {json.dumps(result, indent=2)}")
+        app.logger.info("="*60)
+        
+        return chat_id
     except Exception as e:
-        print(f"AIBot setup test failed: {e}")
+        app.logger.error("="*60)
+        app.logger.error("❌ AIBot Chat Setup Failed")
+        app.logger.error(f"Error: {e}")
+        app.logger.error("="*60)
         return ""
     
 if USE_LLM and AIBOT_API_KEY and AIBOT_API_KEY != 'your_api_key_here':
     aibot_available = True
     chat_id = setup_aibot(temperature=0.3)
-    print("✓ LLM features enabled (Govtech AIBot), chatID = ", chat_id)
+    app.logger.info(f"✓ LLM features enabled (Govtech AIBot), chatID = {chat_id}")
 else:
     aibot_available = False
     USE_LLM = False
-    print("✓ Rule-based processing only")
+    app.logger.info("✓ Rule-based processing only")
 
 def call_aibot(prompt):
     """Call Govtech AIBot Message API"""
@@ -75,19 +105,49 @@ def call_aibot(prompt):
     
     try:
         msg_url = AIBOT_API_URL +  "/" + chat_id + AIBOT_API_MSGS
+        
+        # Log the request details
+        app.logger.info("="*60)
+        app.logger.info("🤖 AIBot API Request")
+        app.logger.info(f"URL: {msg_url}")
+        app.logger.info(f"Prompt: {prompt[:200]}...")  # First 200 chars
+        app.logger.info("="*60)
 
         response = requests.post(
             msg_url,
             headers={"X-ATLAS-Key": AIBOT_API_KEY},
-            data={"content": prompt}
+            data={"content": prompt},
+            verify=False
         )
+        
+        # Log response status
+        app.logger.info(f"📡 AIBot Response Status: {response.status_code}")
+        
         response.raise_for_status()
 
         result = response.json()
         print(f"AIBot result: {result['response']['content']}")
         
-        return result['response']['content']
-
+        # Log the full response
+        app.logger.info("="*60)
+        app.logger.info("🤖 AIBot API Response")
+        app.logger.info(f"Response: {json.dumps(result, indent=2)}")
+        app.logger.info("="*60)
+        
+        # Parse AIBot response format
+        if 'choices' in result and len(result['choices']) > 0:
+            answer = result['choices'][0]['message']['content'].strip()
+            app.logger.info(f"✅ Parsed Answer: {answer}")
+            return answer
+        elif 'response' in result:
+            answer = result['response'].strip()
+            app.logger.info(f"✅ Parsed Answer: {answer}")
+            return answer
+        elif isinstance(result, str):
+            answer = result.strip()
+            app.logger.info(f"✅ Parsed Answer: {answer}")
+            return answer
+        return None
     except Exception as e:
         # Try to extract API error details if present
         try:
@@ -97,9 +157,13 @@ def call_aibot(prompt):
                     err_body = response.json()
                 except Exception:
                     err_body = response.text
-            print(f"AIBot API error: {e}; response body: {err_body}")
+            app.logger.error("="*60)
+            app.logger.error("❌ AIBot API Error")
+            app.logger.error(f"Error: {e}")
+            app.logger.error(f"Response Body: {err_body}")
+            app.logger.error("="*60)
         except Exception:
-            print(f"AIBot API error: {e}")
+            app.logger.error(f"❌ AIBot API error: {e}")
         return None
 
 def remove_sensitive_info(text):
@@ -166,9 +230,9 @@ def rephrase_question(question, use_llm_for_request=None):
                 rephrased = call_aibot(question)
                 rephrased = _parse_possible_json(rephrased)
             except Exception as e:
-                print(f"AIBot error: {e}, falling back to rules")
+                app.logger.error(f"AIBot error: {e}, falling back to rules")
         else:
-            print("⚠️  AI requested but AIBot API key not configured. Using rule-based processing.")
+            app.logger.warning("⚠️  AI requested but AIBot API key not configured. Using rule-based processing.")
     
     # Fallback to rule-based rephrasing
     # Convert to lowercase for pattern matching
@@ -243,9 +307,9 @@ Respond with only 'yes' or 'no'."""
                 if answer:
                     return 'yes' in answer.lower()
             except Exception as e:
-                print(f"AIBot similarity error: {e}, falling back to rules")
+                app.logger.error(f"AIBot similarity error: {e}, falling back to rules")
         else:
-            print("⚠️  AI requested but AIBot API key not configured. Using word-overlap similarity.")
+            app.logger.warning("⚠️  AI requested but AIBot API key not configured. Using word-overlap similarity.")
     
     # Fallback to rule-based similarity
     # Normalize both questions
@@ -321,26 +385,12 @@ def clean_qa_data(df, use_llm_override=None):
             stats['sensitive_info_removed'] += 1
         
         # Rephrase question for standardization
-        if use_llm_for_this_request:
-            rephrased_question = _parse_possible_json(call_aibot(question))
-        else: 
-            rephrased_question = rephrase_question(question, use_llm_for_this_request)
-        # if isinstance(rephrased_question, dict):
-        #     # If LLM returned structured JSON, try to extract a text field
-        #     for k in ('question', 'rephrased', 'text', 'content'):
-        #         if k in rephrased_question and isinstance(rephrased_question[k], str):
-        #             rephrased_question = rephrased_question[k]
-        #             break
-        #     else:
-        #         # fallback to original question
-        #         rephrased_question = question
-
-        # if rephrased_question != question:
-        #     stats['questions_rephrased'] += 1
-        #     question = rephrased_question
-
-        # print(f"Processed question: {question}")
-
+        app.logger.info(f"USING LLM: {use_llm_for_this_request}")
+        rephrased_question = rephrase_question(question, use_llm_for_this_request)
+        if rephrased_question != question:
+            stats['questions_rephrased'] += 1
+            question = rephrased_question
+        
         # Check for similar questions (more aggressive duplicate detection)
         # is_duplicate = False
         # for seen_q in seen_questions:
@@ -603,9 +653,9 @@ def upload_file():
     
     # Warn if AI requested but not configured
     if use_llm_override and not aibot_available:
-        print("⚠️  WARNING: AI processing requested but AIBot API key not configured!")
-        print("   Add your X-ATLAS-Key to .env file to enable AI features.")
-        print("   Falling back to rule-based processing...")
+        app.logger.warning("⚠️  WARNING: AI processing requested but AIBot API key not configured!")
+        app.logger.warning("   Add your X-ATLAS-Key to .env file to enable AI features.")
+        app.logger.warning("   Falling back to rule-based processing...")
     
     try:
         # Read Excel file
@@ -661,6 +711,6 @@ def download_excel():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    print("Starting Q&A Cleaner Server...")
-    print("Server running at http://localhost:5000")
+    app.logger.info("Starting Q&A Cleaner Server...")
+    app.logger.info("Server running at http://localhost:5000")
     app.run(debug=True, port=5000)
