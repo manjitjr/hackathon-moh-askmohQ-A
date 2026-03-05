@@ -259,9 +259,12 @@ td:first-child {
     white-space: nowrap;
 }
 
-td:nth-child(2),
-td:nth-child(5) {
+td:nth-child(2) {
     min-width: 120px;
+    max-width: 200px;
+}
+
+td:nth-child(5) {
     max-width: 100px;
 }
 

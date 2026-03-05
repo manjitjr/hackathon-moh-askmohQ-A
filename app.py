@@ -3,7 +3,6 @@ from flask_cors import CORS
 import pandas as pd
 import re
 import io
-from werkzeug.utils import secure_filename
 import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -11,20 +10,6 @@ import requests
 import json
 from dotenv import load_dotenv
  
-def _parse_possible_json(s):
-    """If `s` is a JSON-looking string, attempt to parse and return Python object; otherwise return original."""
-    if not isinstance(s, str):
-        return s
-    s_stripped = s.strip()
-    if not s_stripped:
-        return s
-    if (s_stripped.startswith('{') or s_stripped.startswith('[')):
-        try:
-            return json.loads(s_stripped)
-        except Exception:
-            return s
-    return s
-
 # Load environment variables
 load_dotenv()
 
@@ -41,6 +26,9 @@ AIBOT_API_URL = os.getenv('AIBOT_API_URL', 'https://api.uat.aibots.gov.sg/v1.0/a
 AIBOT_MODEL = os.getenv('AIBOT_MODEL', 'azure~openai.gpt-4o-mini')
 AIBOT_API_MSGS = os.getenv('AIBOT_API_MSGS', '/messages')
 AIBOT_AGENT_ID = os.getenv('AIBOT_AGENT_ID')
+
+# Set Singapore timezone for timestamping
+sg_tz = ZoneInfo('Asia/Singapore')
 
 def setup_aibot(temperature):
     """Setup AIBot chat"""
@@ -159,12 +147,24 @@ def rephrase_question(question, use_llm_for_request=None):
     use_llm_now = use_llm_for_request if use_llm_for_request is not None else USE_LLM
     if use_llm_now:
         if aibot_available:
+            # Check local database for an existing entry and reuse it if available
+            try:
+                existing = find_existing_entry_by_question(question)
+                if existing:
+                    # Build a rephrased_question dict matching expected schema
+                    rephrased = {
+                        'category': existing.get('category', ''),
+                        'question': existing.get('question') or existing.get('original_question') or question,
+                        'answer': existing.get('answer', ''),
+                        'confidence': {'level': existing.get('confidence', ''), 'reason': existing.get('reason', '')}
+                    }
+                    return rephrased
+            except Exception:
+                pass
+
             try:
                 rephrased = call_aibot(question)
                 rephrased = _parse_possible_json(rephrased)
-                # if rephrased and rephrased.endswith('?'):
-                #     print(f"LLM rephrased question: {rephrased}")
-                #     return rephrased
             except Exception as e:
                 print(f"AIBot error: {e}, falling back to rules")
         else:
@@ -365,7 +365,85 @@ def clean_qa_data(df, use_llm_override=None):
     
     return cleaned_data, stats
 
-def save_database_excel(cleaned_data):
+
+def _normalize_text(s: str) -> str:
+    """Normalize text for duplicate checking (module-level helper)."""
+    try:
+        if pd.isna(s):
+            return ''
+    except Exception:
+        pass
+    if s is None:
+        return ''
+    s = str(s).strip().lower()
+    if s == 'nan':
+        return ''
+    s = re.sub(r'[\W_]+', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
+def collect_existing_questions_from_df(existing_df: pd.DataFrame) -> set:
+    """Collect normalized question strings from any question-like columns in a DataFrame."""
+    existing_questions = set()
+    for col in existing_df.columns:
+        try:
+            col_lower = str(col).lower()
+        except Exception:
+            col_lower = ''
+        if 'question' in col_lower or col_lower == 'q' or col_lower.startswith('q'):
+            existing_df[col] = existing_df[col].fillna('').astype(str)
+            for x in existing_df[col].tolist():
+                nx = _normalize_text(x)
+                if nx:
+                    existing_questions.add(nx)
+    return existing_questions
+
+
+def is_duplicate_row(row: pd.Series, existing_questions: set) -> tuple:
+    """Return (is_duplicate: bool, key_used: str) for the given row.
+    Prefers `original_question` normalized value, falls back to `question`.
+    """
+    norm_orig = _normalize_text(row.get('original_question', ''))
+    norm_q = _normalize_text(row.get('question', ''))
+    key_used = norm_orig or norm_q
+    if key_used and key_used in existing_questions:
+        return True, key_used
+    return False, key_used
+
+
+def find_existing_entry_by_question(question_text: str, filename: str = 'database.xlsx') -> dict | None:
+    """Search the Excel database for a matching question and return a dict row if found."""
+    if not question_text:
+        return None
+    key = _normalize_text(question_text)
+    if not key:
+        return None
+
+    if not os.path.exists(filename):
+        return None
+
+    try:
+        df = pd.read_excel(filename)
+    except Exception:
+        return None
+
+    # Check any question-like column for a match (original_question preferred)
+    for col in df.columns:
+        try:
+            col_lower = str(col).lower()
+        except Exception:
+            col_lower = ''
+        if 'question' in col_lower or col_lower == 'q' or col_lower.startswith('q'):
+            for _, r in df.iterrows():
+                val = r.get(col, '')
+                if _normalize_text(val) == key:
+                    # convert row to a consistent dict shape
+                    rowd = {c: (r.get(c, '') if not pd.isna(r.get(c, '')) else '') for c in df.columns}
+                    return rowd
+    return None
+
+def save_database_excel(df, cleaned_data):
     """Save cleaned data to a database Excel file (append or create)."""
     filename = 'database.xlsx'
     # Ensure list of dicts
@@ -375,16 +453,50 @@ def save_database_excel(cleaned_data):
         # If cleaned_data is not a list of dicts, attempt to normalize
         new_data = pd.DataFrame([item if isinstance(item, dict) else {'question': str(item)} for item in cleaned_data])
 
+    # Attempt to recover the original question text from the uploaded `df`
+    # to store alongside the cleaned/rephrased question. This mirrors the
+    # filtering logic in `clean_qa_data` so the lengths should align.
+    original_questions = []
+    try:
+        # identify question column in original df
+        qcol = None
+        for c in df.columns.tolist():
+            cl = str(c).lower()
+            if 'question' in cl or cl == 'q':
+                qcol = c
+                break
+        if qcol is None and len(df.columns) > 0:
+            qcol = df.columns[0]
+
+        if qcol is not None:
+            for _, row in df.iterrows():
+                raw_q = clean_text(row.get(qcol, ''))
+                if not raw_q:
+                    continue
+                if len(raw_q) < 3:
+                    continue
+                original_questions.append(raw_q)
+    except Exception:
+        original_questions = []
+
+    # If we successfully extracted original questions and the counts align,
+    # add them as an `original_question` column to the new data.
+    if original_questions:
+        try:
+            if 'original_question' not in new_data.columns:
+                # If lengths differ, align by taking the first N entries.
+                if len(original_questions) >= len(new_data):
+                    new_data['original_question'] = original_questions[:len(new_data)]
+                else:
+                    # pad with empty strings if fewer originals than cleaned rows
+                    padded = original_questions + [''] * (len(new_data) - len(original_questions))
+                    new_data['original_question'] = padded
+        except Exception:
+            pass
+
     # Add timestamp column for when these rows were saved (Singapore timezone)
     try:
-        if ZoneInfo is not None:
-            sg_tz = ZoneInfo('Asia/Singapore')
-            timestamp = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %Z')
-        else:
-            # Fallback: use UTC+8 offset if zoneinfo not available
-            from datetime import timezone, timedelta
-            sg_tz = timezone(timedelta(hours=8))
-            timestamp = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %z')
+        timestamp = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %Z')
     except Exception:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     # Ensure there's a 'question' column we can use to detect duplicates
@@ -406,47 +518,29 @@ def save_database_excel(cleaned_data):
     # Add timestamp only for new rows (will be set on rows that are appended)
     new_data['date_time'] = ''
 
-    def _normalize_text(s: str) -> str:
-        if s is None:
-            return ''
-        s = str(s).strip().lower()
-        # remove punctuation and extra spaces
-        s = re.sub(r'[\W_]+', ' ', s)
-        s = re.sub(r'\s+', ' ', s).strip()
-        return s
-
     # If file exists, read existing questions and filter out duplicates
     if os.path.exists(filename):
         try:
             existing_data = pd.read_excel(filename)
-            # collect normalized existing questions from likely columns
-            existing_questions = set()
-            for col in ('question', 'original_question'):
-                if col in existing_data.columns:
-                    existing_data[col] = existing_data[col].fillna('').astype(str)
-                    existing_questions.update(_normalize_text(x) for x in existing_data[col].tolist())
+            # collect normalized existing questions from any question-like column
+            existing_questions = collect_existing_questions_from_df(existing_data)
 
-            # Determine rows to append (those whose normalized question is not in existing_questions)
+            # Determine rows to append (skip when original_question or question already exists)
             to_append_rows = []
             for _, row in new_data.iterrows():
-                nq = _normalize_text(row.get('question', ''))
-                if nq and nq not in existing_questions:
+                is_dup, key_used = is_duplicate_row(row, existing_questions)
+                if not is_dup and key_used:
                     # set timestamp for this appended row
                     try:
-                        if ZoneInfo is not None:
-                            sg_tz = ZoneInfo('Asia/Singapore')
-                            row_ts = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %Z')
-                        else:
-                            from datetime import timezone, timedelta
-                            sg_tz = timezone(timedelta(hours=8))
-                            row_ts = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %z')
+                        row_ts = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %Z')
                     except Exception:
                         row_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     row = row.copy()
                     row['date_time'] = row_ts
                     to_append_rows.append(row)
+                    existing_questions.add(key_used)
                 else:
-                    # duplicate detected; skip
+                    # duplicate detected or no usable question; skip
                     pass
 
             if not to_append_rows:
@@ -470,19 +564,26 @@ def save_database_excel(cleaned_data):
     else:
         # New file: set timestamp for all rows
         try:
-            if ZoneInfo is not None:
-                sg_tz = ZoneInfo('Asia/Singapore')
-                row_ts = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %Z')
-            else:
-                from datetime import timezone, timedelta
-                sg_tz = timezone(timedelta(hours=8))
-                row_ts = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %z')
+            row_ts = datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %Z')
         except Exception:
             row_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         new_data['date_time'] = row_ts
         new_data.to_excel(filename, index=False)
 
+def _parse_possible_json(s):
+    """If `s` is a JSON-looking string, attempt to parse and return Python object; otherwise return original."""
+    if not isinstance(s, str):
+        return s
+    s_stripped = s.strip()
+    if not s_stripped:
+        return s
+    if (s_stripped.startswith('{') or s_stripped.startswith('[')):
+        try:
+            return json.loads(s_stripped)
+        except Exception:
+            return s
+    return s
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -517,7 +618,7 @@ def upload_file():
 
         # Persist cleaned results to local database.xlsx (append)
         try:
-            save_database_excel(cleaned_data)
+            save_database_excel(df, cleaned_data)
             print('Saved cleaned data to database.xlsx')
         except Exception as e:
             print(f'Warning: failed to save cleaned data to database.xlsx: {e}')
