@@ -38,12 +38,32 @@ AIBOT_AGENT_ID = os.getenv('AIBOT_AGENT_ID')
 # Set Singapore timezone for timestamping
 sg_tz = ZoneInfo('Asia/Singapore')
 
+# State file for storing AIBot chat id
+STATE_FILE = 'aibot_config.json'
+
+def load_aibot_state(filename: str = STATE_FILE) -> str | None:
+    try:
+        if not os.path.exists(filename):
+            return None
+        with open(filename, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data.get('chat_id')
+    except Exception:
+        return None
+
+def save_aibot_state(chat_id: str, filename: str = STATE_FILE) -> None:
+    try:
+        payload = {
+            'chat_id': chat_id,
+            'saved_at': datetime.now(sg_tz).strftime('%Y-%m-%d %H:%M:%S %Z') if sg_tz else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        app.logger.warning(f"Could not save AIBot state to {filename}: {e}")
+
 def setup_aibot(temperature):
     """Setup AIBot chat"""
-    if not aibot_available:
-        app.logger.warning("⚠️  AIBot API key not configured. Skipping AIBot setup.")
-        return ""
-    
     try:
         headers = {
             'X-ATLAS-Key': AIBOT_API_KEY,
@@ -74,6 +94,12 @@ def setup_aibot(temperature):
         
         result = response.json()
         chat_id = result.get('id')
+        # persist chat_id for future runs
+        if chat_id:
+            try:
+                save_aibot_state(chat_id)
+            except Exception:
+                app.logger.warning('Failed to persist chat_id')
         
         app.logger.info("="*60)
         app.logger.info("✅ AIBot Chat Setup Successful")
@@ -91,7 +117,12 @@ def setup_aibot(temperature):
     
 if USE_LLM and AIBOT_API_KEY and AIBOT_API_KEY != 'your_api_key_here':
     aibot_available = True
-    chat_id = setup_aibot(temperature=0.3)
+    # Prefer explicit env override, then persisted state, then create a new chat
+    chat_id =  load_aibot_state()
+    if not chat_id:
+        chat_id = setup_aibot(temperature=0.3)
+    else:
+        app.logger.info(f"✓ Loaded AIBot chatID from env/state: {chat_id}")
     app.logger.info(f"✓ LLM features enabled (Govtech AIBot), chatID = {chat_id}")
 else:
     aibot_available = False
@@ -240,26 +271,7 @@ def rephrase_question(question, use_llm_for_request=None):
 
             try:
                 # Create a structured prompt for the AIBot
-                prompt = f"""Analyze this healthcare question and provide a structured response in JSON format:
-
-Question: "{question}"
-
-Please provide:
-1. A categorized topic (e.g., "General Healthcare", "Medication", "Symptoms", "Treatment", "Prevention")
-2. A standardized, generic version of the question (remove personal details, make it general)
-3. A brief, accurate answer to the question
-4. Your confidence level (High/Medium/Low) and reason
-
-Respond ONLY with valid JSON in this exact format:
-{{
-  "category": "Category Name",
-  "question": "Standardized generic question?",
-  "answer": "Brief accurate answer",
-  "confidence": {{
-    "level": "High/Medium/Low",
-    "reason": "Brief explanation"
-  }}
-}}"""
+                prompt = question
                 
                 app.logger.info(f"📤 Calling AIBot for question: {question[:100]}...")
                 rephrased = call_aibot(prompt)
@@ -343,46 +355,6 @@ def clean_text(text):
     text = re.sub(r' +', ' ', text)
     
     return text
-
-def is_similar_question(q1, q2, threshold=0.8, use_llm_for_request=None):
-    """Check if two questions are similar (fuzzy matching)"""
-    # Use LLM for semantic similarity if enabled
-    use_llm_now = use_llm_for_request if use_llm_for_request is not None else USE_LLM
-    if use_llm_now:
-        if aibot_available:
-            try:
-                prompt = f"""You are a similarity checker. Respond with only 'yes' or 'no' to indicate if two questions ask essentially the same thing.
-
-Are these questions essentially the same?
-1: {q1}
-2: {q2}
-
-Respond with only 'yes' or 'no'."""
-                answer = call_aibot(prompt)
-                if answer:
-                    return 'yes' in answer.lower()
-            except Exception as e:
-                app.logger.error(f"AIBot similarity error: {e}, falling back to rules")
-        else:
-            app.logger.warning("⚠️  AI requested but AIBot API key not configured. Using word-overlap similarity.")
-    
-    # Fallback to rule-based similarity
-    # Normalize both questions
-    q1_norm = re.sub(r'[^\w\s]', '', q1.lower())
-    q2_norm = re.sub(r'[^\w\s]', '', q2.lower())
-    
-    # Simple similarity check based on word overlap
-    words1 = set(q1_norm.split())
-    words2 = set(q2_norm.split())
-    
-    if len(words1) == 0 or len(words2) == 0:
-        return False
-    
-    intersection = len(words1.intersection(words2))
-    union = len(words1.union(words2))
-    
-    similarity = intersection / union if union > 0 else 0
-    return similarity >= threshold
 
 def clean_qa_data_stream(df, use_llm_override=None):
     """Generator function that yields progress for each Q&A processed"""
@@ -543,16 +515,6 @@ def clean_qa_data(df, use_llm_override=None):
         if rephrased_question != question:
             stats['questions_rephrased'] += 1
         
-        # Check for similar questions (more aggressive duplicate detection)
-        # is_duplicate = False
-        # for seen_q in seen_questions:
-        #     if is_similar_question(question, seen_q, 0.8, use_llm_for_this_request):
-        #         is_duplicate = True
-        #         stats['duplicates_removed'] += 1
-        #         break
-        
-        # if is_duplicate:
-        #     continue
         seen_questions.append(question)
         # Attempt to extract category and answer columns if present
 
