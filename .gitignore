@@ -13,6 +13,8 @@ build/
 
 # Uploads folder
 uploads/
+# Exception: Allow logo file
+!uploads/askmoh-wingman-logo.png
 *.xlsx
 *.xls
 *.csv
