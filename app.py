@@ -148,7 +148,8 @@ def call_aibot(prompt):
             msg_url,
             headers={"X-ATLAS-Key": AIBOT_API_KEY},
             data={"content": prompt},
-            verify=False
+            verify=False,
+            timeout=30  # 30 second timeout
         )
         
         # Log response status
@@ -887,6 +888,11 @@ def download_excel():
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({'status': 'ok', 'message': 'Server is running'}), 200
 
 if __name__ == '__main__':
     app.logger.info("Starting Q&A Cleaner Server...")

@@ -107,8 +107,8 @@ document.addEventListener('DOMContentLoaded', function() {
         console.log('🎚️ AI Toggle:', aiToggle.checked ? 'ON (AI Enabled)' : 'OFF (Rule-based)');
         
         try {
-            // Use fetch with streaming
-            const response = await fetch('http://localhost:5000/upload/stream', {
+            // Use regular upload endpoint instead of streaming
+            const response = await fetch('http://localhost:5000/upload', {
                 method: 'POST',
                 body: formData
             });
@@ -117,62 +117,21 @@ document.addEventListener('DOMContentLoaded', function() {
                 throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
             
-            // Process SSE stream
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-            let totalQuestions = 0;
-            let processedData = [];
-            let finalStats = null;
+            // Process JSON response (non-streaming)
+            updateStatus('Processing file...', 50);
+            const data = await response.json();
             
-            while (true) {
-                const {done, value} = await reader.read();
-                
-                if (done) break;
-                
-                buffer += decoder.decode(value, {stream: true});
-                const lines = buffer.split('\\n\\n');
-                buffer = lines.pop() || '';
-                
-                for (const line of lines) {
-                    if (line.startsWith('data: ')) {
-                        const data = JSON.parse(line.slice(6));
-                        
-                        if (data.type === 'start') {
-                            totalQuestions = data.total;
-                            updateStatus(`Processing ${totalQuestions} questions...`, 30);
-                        } else if (data.type === 'progress') {
-                            // Update progress bar
-                            const progress = 30 + (data.percentage * 0.6); // Scale to 30-90%
-                            updateStatus(`Processing question ${data.index} of ${data.total}...`, progress);
-                            
-                            // Add row to table in real-time
-                            processedData.push(data.data);
-                            addRowToTable(data.data, data.index);
-                            
-                            // Show results section if not already visible
-                            if (resultsSection.style.display === 'none') {
-                                resultsSection.style.display = 'block';
-                            }
-                        } else if (data.type === 'complete') {
-                            cleanedData = {
-                                cleaned_data: data.cleaned_data,
-                                total_questions: data.total_questions,
-                                ...data.stats
-                            };
-                            finalStats = data.stats;
-                            updateStatus('Complete!', 100);
-                            
-                            // Update stats display
-                            updateStatsDisplay(cleanedData);
-                            
-                            handleApiResponse(response, `Successfully cleaned ${data.total_questions} questions!`);
-                        } else if (data.type === 'error') {
-                            throw new Error(data.message);
-                        }
-                    }
-                }
-            }
+            updateStatus('Complete!', 100);
+            
+            // Store cleaned data
+            cleanedData = data;
+            
+            // Display results
+            resultsSection.style.display = 'block';
+            displayResults(data);
+            updateStatsDisplay(data);
+            
+            handleApiResponse(response, `Successfully cleaned ${data.total_questions} questions!`);
             
         } catch (error) {
             console.error('❌ Upload error:', error);
