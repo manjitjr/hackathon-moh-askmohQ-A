@@ -48,6 +48,35 @@ document.addEventListener('DOMContentLoaded', function() {
         fileInput.click();
     });
 
+    // Helpers to normalize different response shapes
+    function normalizeItems(data) {
+        if (!data) return [];
+        if (Array.isArray(data)) return data;
+        if (data.cleaned_data && Array.isArray(data.cleaned_data)) return data.cleaned_data;
+        // If response contains a single item (has keys like raw_intent/public_question), wrap it
+        if (typeof data === 'object' && (data.raw_intent || data.public_question || data.case_id || data.draft_answer)) {
+            return [data];
+        }
+        return [];
+    }
+
+    function getField(item, ...keys) {
+        if (!item) return '';
+        for (const k of keys) {
+            const v = item[k];
+            if (v !== undefined && v !== null && v !== '') {
+                // If confidence is an object, pick a readable value
+                if (typeof v === 'object') {
+                    if (v.level) return v.level;
+                    if (v.reason) return v.reason;
+                    return JSON.stringify(v);
+                }
+                return v;
+            }
+        }
+        return '';
+    }
+
     // File selection
     fileInput.addEventListener('change', (e) => {
         handleFileSelect(e.target.files[0]);
@@ -125,13 +154,14 @@ document.addEventListener('DOMContentLoaded', function() {
             
             // Store cleaned data
             cleanedData = data;
-            
+
             // Display results
             resultsSection.style.display = 'block';
             displayResults(data);
             updateStatsDisplay(data);
-            
-            handleApiResponse(response, `Successfully cleaned ${data.total_questions} questions!`);
+
+            const items = normalizeItems(data);
+            handleApiResponse(response, `Successfully cleaned ${items.length} questions!`);
             
         } catch (error) {
             console.error('❌ Upload error:', error);
@@ -165,9 +195,9 @@ document.addEventListener('DOMContentLoaded', function() {
             <td>${index}</td>
             <td><span class="category-badge">${item.category || 'General'}</span></td>
             <td>${item.question}</td>
-            <td>${item.answer}</td>
+            <td>${item.is_potential_qa}</td>
+            <td>${item.draft_answer}</td>
             <td>${item.confidence}</td>
-            <td>${item.reason}</td>
         `;
         previewBody.appendChild(row);
         
@@ -179,48 +209,55 @@ document.addEventListener('DOMContentLoaded', function() {
     }
     
     function updateStatsDisplay(data) {
-        document.getElementById('totalQuestions').textContent = data.total_questions;
-        document.getElementById('removedDuplicates').textContent = data.duplicates_removed;
-        document.getElementById('fixedIssues').textContent = data.issues_fixed;
-        document.getElementById('sensitiveInfo').textContent = data.sensitive_info_removed || 0;
-        document.getElementById('rephrased').textContent = data.questions_rephrased || 0;
+        const items = normalizeItems(data);
+        document.getElementById('totalQuestions').textContent = data && data.total_questions !== undefined ? data.total_questions : items.length;
+        document.getElementById('removedDuplicates').textContent = data && data.duplicates_removed !== undefined ? data.duplicates_removed : 0;
+        document.getElementById('fixedIssues').textContent = data && data.issues_fixed !== undefined ? data.issues_fixed : 0;
+        document.getElementById('sensitiveInfo').textContent = data && data.sensitive_info_removed !== undefined ? data.sensitive_info_removed : 0;
+        document.getElementById('rephrased').textContent = data && data.questions_rephrased !== undefined ? data.questions_rephrased : 0;
     }
 
     function displayResults(data) {
         statusSection.style.display = 'none';
         resultsSection.style.display = 'block';
-        
-        document.getElementById('totalQuestions').textContent = data.total_questions;
-        document.getElementById('removedDuplicates').textContent = data.duplicates_removed;
-        document.getElementById('fixedIssues').textContent = data.issues_fixed;
-        document.getElementById('sensitiveInfo').textContent = data.sensitive_info_removed || 0;
-        document.getElementById('rephrased').textContent = data.questions_rephrased || 0;
-        
         const previewBody = document.getElementById('previewBody');
         previewBody.innerHTML = '';
-        
+
+        const items = normalizeItems(data);
+
+        // Update stats using normalized items
+        document.getElementById('totalQuestions').textContent = data && data.total_questions !== undefined ? data.total_questions : items.length;
+        document.getElementById('removedDuplicates').textContent = data && data.duplicates_removed !== undefined ? data.duplicates_removed : 0;
+        document.getElementById('fixedIssues').textContent = data && data.issues_fixed !== undefined ? data.issues_fixed : 0;
+        document.getElementById('sensitiveInfo').textContent = data && data.sensitive_info_removed !== undefined ? data.sensitive_info_removed : 0;
+        document.getElementById('rephrased').textContent = data && data.questions_rephrased !== undefined ? data.questions_rephrased : 0;
+
         // Display ALL questions (not just first 10)
-        data.cleaned_data.forEach((item, index) => {
+        items.forEach((item, index) => {
             const row = document.createElement('tr');
+            const question = getField(item, 'question', 'public_question', 'raw_intent');
+            const answer = getField(item, 'answer', 'draft_answer');
+            const confidence = item && typeof item.confidence === 'object' ? (item.confidence.level || item.confidence.reason || JSON.stringify(item.confidence)) : (item && item.confidence ? item.confidence : '');
             row.innerHTML = `
                 <td>${index + 1}</td>
-                <td><span class="category-badge">${item.category || 'General'}</span></td>
-                <td>${item.question}</td>
-                <td>${item.answer}</td>
-                <td>${item.confidence}</td>
-                <td>${item.reason}</td>
+                <td>${getField(item, 'is_potential_qa')}</td>
+                <td>${getField(item, 'raw_intent')}</td>
+                <td>${question}</td>
+                <td>${answer}</td>
+                <td>${confidence}</td>
             `;
             previewBody.appendChild(row);
         });
-        
+
         uploadBtn.disabled = false;
     }
 
     // Download handlers
     document.getElementById('downloadJsonBtn').addEventListener('click', () => {
         if (!cleanedData) return;
+        const items = normalizeItems(cleanedData);
         downloadFile(
-            JSON.stringify(cleanedData.cleaned_data, null, 2),
+            JSON.stringify(items, null, 2),
             'cleaned_qa_data.json',
             'application/json'
         );
@@ -229,9 +266,19 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('downloadCsvBtn').addEventListener('click', () => {
         if (!cleanedData) return;
         
-        let csv = 'Category,Question,Answer,Confidence,Reason\n';
-        cleanedData.cleaned_data.forEach(item => {
-            csv += `"${(item.category || 'General').replace(/"/g, '""')}","${item.question.replace(/"/g, '""')}","${item.answer.replace(/"/g, '""')}"\n`;
+        let csv = 'Category,Question,Answer,Confidence,Reason,Review Required,Review Notes\n';
+        const items = normalizeItems(cleanedData);
+        items.forEach(item => {
+            const category = getField(item, 'category');
+            const raw_intent = getField(item, 'raw_intent');
+            const question = getField(item, 'public_question');
+            const answer = getField(item, 'draft_answer');
+            const confidence = item && typeof item.confidence === 'object' ? (item.confidence.level || item.confidence.reason || '') : (item && item.confidence ? String(item.confidence) : '');
+            const reason = getField(item, 'confidence.reason');
+            const review_required = getField(item, 'review_required');
+            const review_notes = getField(item, 'review_notes');
+            const esc = s => String(s).replace(/"/g, '""');
+            csv += `"${esc(category)}","${esc(raw_intent)}","${esc(question)}","${esc(answer)}","${esc(confidence)}","${esc(reason)}","${esc(review_required)}","${esc(review_notes)}"\n`;
         });
         
         downloadFile(csv, 'cleaned_qa_data.csv', 'text/csv');
@@ -246,7 +293,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify(cleanedData.cleaned_data)
+                body: JSON.stringify(normalizeItems(cleanedData))
             });
             
             if (!response.ok) {

@@ -31,7 +31,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 USE_LLM = os.getenv('USE_LLM', 'false').lower() == 'true'
 AIBOT_API_KEY = os.getenv('AIBOT_API_KEY')
 AIBOT_API_URL = os.getenv('AIBOT_API_URL', 'https://api.uat.aibots.gov.sg/v1.0/api/chats')
-AIBOT_MODEL = os.getenv('AIBOT_MODEL', 'azure~openai.gpt-4o-mini')
+AIBOT_MODEL = os.getenv('AIBOT_MODEL', '')
 AIBOT_API_MSGS = os.getenv('AIBOT_API_MSGS', '/messages')
 AIBOT_AGENT_ID = os.getenv('AIBOT_AGENT_ID')
 
@@ -273,22 +273,45 @@ def rephrase_question(question, use_llm_for_request=None):
             try:
                 # Create a structured prompt for the AIBot
                 prompt = question
-                
+
                 app.logger.info(f"📤 Calling AIBot for question: {question[:100]}...")
                 rephrased = call_aibot(prompt)
-                
+
                 if rephrased:
                     rephrased = _parse_possible_json(rephrased)
                     app.logger.info(f"✅ AIBot response received: {str(rephrased)[:200]}...")
-                    
-                    # Ensure it's in the correct format
-                    if isinstance(rephrased, dict):
+
+                    # If the AIBot returns the new standardized schema, accept it.
+                    if isinstance(rephrased, dict) and ('is_potential_qa' in rephrased or 'raw_intent' in rephrased):
                         return rephrased
-                    else:
-                        app.logger.warning(f"⚠️ AIBot response not in expected format, using fallback")
+
+                    # Otherwise try to map older/other formats into the new schema
+                    if isinstance(rephrased, dict):
+                        mapped = {
+                            'case_id': rephrased.get('case_id', ''),
+                            'is_potential_qa': rephrased.get('is_potential_qa', 'Needs Review'),
+                            'decision_reason': rephrased.get('decision_reason', ''),
+                            'raw_intent': rephrased.get('raw_intent', rephrased.get('intent', rephrased.get('question', ''))),
+                            'category': rephrased.get('category', ''),
+                            'public_question': rephrased.get('public_question', rephrased.get('question', '')),
+                            'draft_answer': rephrased.get('draft_answer', rephrased.get('answer', '')),
+                            'case_specific_elements_removed': rephrased.get('case_specific_elements_removed', []),
+                            'review_required': rephrased.get('review_required', 'Yes'),
+                            'review_notes': rephrased.get('review_notes', ''),
+                            'confidence': rephrased.get('confidence', {'level': rephrased.get('confidence', 'Low'), 'reason': ''})
+                        }
+                        return mapped
+
+                    # If it's a string try to parse JSON from it
+                    if isinstance(rephrased, str):
+                        parsed = _parse_possible_json(rephrased)
+                        if isinstance(parsed, dict):
+                            return parsed
+
+                    app.logger.warning(f"⚠️ AIBot response not in expected format, using fallback")
                 else:
                     app.logger.warning(f"⚠️ No response from AIBot, using fallback")
-                    
+
             except Exception as e:
                 app.logger.error(f"❌ AIBot error: {e}, falling back to rules")
         else:
@@ -329,10 +352,18 @@ def rephrase_question(question, use_llm_for_request=None):
         rephrased += '?'
     
     # Return structured format matching LLM response
+    # Map to new simplified schema while keeping legacy fields for storage
     return {
+        'case_id': '',
+        'is_potential_qa': 'Needs Review',
+        'decision_reason': '',
+        'raw_intent': '',
         'category': 'General Healthcare',
-        'question': rephrased,
-        'answer': '',
+        'public_question': rephrased,
+        'draft_answer': '',
+        'case_specific_elements_removed': [],
+        'review_required': 'Yes',
+        'review_notes': '',
         'confidence': {'level': 'Low', 'reason': 'Rule-based processing without LLM analysis'}
     }
 
@@ -406,29 +437,39 @@ def clean_qa_data_stream(df, use_llm_override=None):
         # Rephrase question
         rephrased_result = rephrase_question(question, use_llm_for_this_request)
         
-        # Handle both dict and string responses
-        if isinstance(rephrased_result, dict):
-            rephrased_question = rephrased_result.get('question', question)
-        else:
-            rephrased_question = rephrased_result
+        # Normalize rephrased_result to dict following new schema
+        if not isinstance(rephrased_result, dict):
             rephrased_result = {
-                'category': 'General Healthcare',
-                'question': rephrased_question,
-                'answer': '',
+                'case_id': '',
+                'is_potential_qa': 'Needs Review',
+                'raw_intent': rephrased_result,
+                'public_question': rephrased_result,
+                'draft_answer': '',
                 'confidence': {'level': 'Low', 'reason': 'Rule-based processing'}
             }
-        
-        if rephrased_question != question:
+
+        public_q = rephrased_result.get('public_question') or rephrased_result.get('question') or question
+        raw_intent = rephrased_result.get('raw_intent') or rephrased_result.get('raw_intent') or question
+        draft_ans = rephrased_result.get('draft_answer') or rephrased_result.get('answer', '')
+        is_potential = rephrased_result.get('is_potential_qa', 'Needs Review')
+        conf = rephrased_result.get('confidence', {})
+        conf_level = conf.get('level') if isinstance(conf, dict) else (conf or 'Low')
+
+        if public_q != question:
             stats['questions_rephrased'] += 1
-        
+
         seen_questions.append(question)
-        
+
+        # cleaned_item keeps legacy `question` for storage but contains the new fields
         cleaned_item = {
-            'category': rephrased_result.get('category', 'General Healthcare'),
-            'question': rephrased_result.get('question', rephrased_question),
-            'answer': rephrased_result.get('answer', ''),
-            'confidence': rephrased_result.get('confidence', {}).get('level', 'Low'),
-            'reason': rephrased_result.get('confidence', {}).get('reason', ''),
+            'case_id': rephrased_result.get('case_id', ''),
+            'is_potential_qa': is_potential,
+            'raw_intent': raw_intent,
+            'public_question': public_q,
+            'draft_answer': draft_ans,
+            'confidence': conf_level,
+            # keep a `question` field for compatibility with saving logic
+            'question': public_q
         }
         
         # Yield progress update
@@ -461,7 +502,7 @@ def clean_qa_data(df, use_llm_override=None):
     # Look for question, answer, and category columns
     for col in columns:
         col_lower = str(col).lower()
-        if 'question' in col_lower or 'q' == col_lower:
+        if 'question' in col_lower or 'q' == col_lower or 'case description' in col_lower:
             question_col = col
     
     # If not found, use first columns
@@ -500,31 +541,38 @@ def clean_qa_data(df, use_llm_override=None):
         app.logger.info(f"USING LLM: {use_llm_for_this_request}")
         rephrased_result = rephrase_question(question, use_llm_for_this_request)
         
-        # Handle both dict (LLM/structured) and string (fallback) responses
-        if isinstance(rephrased_result, dict):
-            rephrased_question = rephrased_result.get('question', question)
-        else:
-            # Old format - shouldn't happen now but keep for safety
-            rephrased_question = rephrased_result
+        # Normalize result into new schema for storage
+        if not isinstance(rephrased_result, dict):
             rephrased_result = {
-                'category': 'General Healthcare',
-                'question': rephrased_question,
-                'answer': '',
+                'case_id': '',
+                'is_potential_qa': '',
+                'raw_intent': rephrased_result,
+                'public_question': rephrased_result,
+                'draft_answer': '',
                 'confidence': {'level': 'Low', 'reason': 'Rule-based processing'}
             }
-        
-        if rephrased_question != question:
+
+        public_q = rephrased_result.get('public_question') or rephrased_result.get('question') or question
+        raw_intent = rephrased_result.get('raw_intent') or question
+        draft_ans = rephrased_result.get('draft_answer') or rephrased_result.get('answer', '')
+        is_potential = rephrased_result.get('is_potential_qa', 'Needs Review')
+        conf = rephrased_result.get('confidence', {})
+        conf_level = conf.get('level') if isinstance(conf, dict) else (conf or 'Low')
+
+        if public_q != question:
             stats['questions_rephrased'] += 1
-        
+
         seen_questions.append(question)
-        # Attempt to extract category and answer columns if present
 
         cleaned_data.append({
-            'category': rephrased_result.get('category', 'General Healthcare'),
-            'question': rephrased_result.get('question', rephrased_question),
-            'answer': rephrased_result.get('answer', ''),
-            'confidence': rephrased_result.get('confidence', {}).get('level', 'Low'),
-            'reason': rephrased_result.get('confidence', {}).get('reason', ''),
+            'case_id': rephrased_result.get('case_id', ''),
+            'is_potential_qa': is_potential,
+            'raw_intent': raw_intent,
+            'public_question': public_q,
+            'draft_answer': draft_ans,
+            'confidence': conf_level,
+            # keep `question` for backward compatibility with save logic
+            'question': public_q
         })
         # cleaned_data.append(rephrased_question)
     
@@ -599,7 +647,7 @@ def find_existing_entry_by_question(question_text: str, filename: str = 'databas
             col_lower = str(col).lower()
         except Exception:
             col_lower = ''
-        if 'question' in col_lower or col_lower == 'q' or col_lower.startswith('q'):
+        if 'question' in col_lower or col_lower == 'q' or col_lower.startswith('q') or 'case description' in col_lower:
             for _, r in df.iterrows():
                 val = r.get(col, '')
                 if _normalize_text(val) == key:
@@ -778,8 +826,8 @@ def upload_file():
         
         # Clean the data with AI override
         cleaned_data, stats = clean_qa_data(df, use_llm_override)
-        print(f"Cleaning stats: {cleaned_data}")
-        print(f"Cleaning stats: {stats}")
+        # print(f"Cleaning stats: {cleaned_data}")
+        # print(f"Cleaning stats: {stats}")
 
         # Persist cleaned results to local database.xlsx (append)
         try:
@@ -787,11 +835,21 @@ def upload_file():
             print('Saved cleaned data to database.xlsx')
         except Exception as e:
             print(f'Warning: failed to save cleaned data to database.xlsx: {e}')
-        
+        # Prepare display-only payload (only specific fields requested)
+        cleaned_display = []
+        for item in cleaned_data:
+            cleaned_display.append({
+                'is_potential_qa': item.get('is_potential_qa', 'Needs Review'),
+                'raw_intent': item.get('raw_intent', ''),
+                'public_question': item.get('public_question', item.get('question', '')),
+                'draft_answer': item.get('draft_answer', ''),
+                'confidence': item.get('confidence', '')
+            })
+
         return jsonify({
             'success': True,
-            'cleaned_data': cleaned_data,
-            'total_questions': len(cleaned_data),
+            'cleaned_data': cleaned_display,
+            'total_questions': len(cleaned_display),
             'duplicates_removed': stats['duplicates_removed'],
             'issues_fixed': stats['issues_fixed'],
             'sensitive_info_removed': stats['sensitive_info_removed'],
@@ -847,9 +905,25 @@ def upload_file_stream():
                     # Update stats
                     if result.get('stats'):
                         stats.update(result['stats'])
-                    
+
+                    # Reduce payload to display-only fields
+                    reduced = {
+                        'type': 'progress',
+                        'index': result.get('index'),
+                        'total': result.get('total'),
+                        'percentage': result.get('percentage'),
+                        'data': {
+                            'is_potential_qa': result['data'].get('is_potential_qa', 'Needs Review'),
+                            'raw_intent': result['data'].get('raw_intent', ''),
+                            'public_question': result['data'].get('public_question', result['data'].get('question', '')),
+                            'draft_answer': result['data'].get('draft_answer', ''),
+                            'confidence': result['data'].get('confidence', '')
+                        },
+                        'stats': stats.copy()
+                    }
+
                     # Send progress update
-                    yield f"data: {json.dumps(result)}\\n\\n"
+                    yield f"data: {json.dumps(reduced)}\\n\\n"
             
             # Save to database
             try:
@@ -857,8 +931,17 @@ def upload_file_stream():
             except Exception as e:
                 app.logger.error(f'Failed to save to database: {e}')
             
+            # Prepare reduced cleaned data for completion
+            reduced_final = [{
+                'is_potential_qa': x.get('is_potential_qa', 'Needs Review'),
+                'raw_intent': x.get('raw_intent', ''),
+                'public_question': x.get('public_question', x.get('question', '')),
+                'draft_answer': x.get('draft_answer', ''),
+                'confidence': x.get('confidence', '')
+            } for x in cleaned_data]
+
             # Send completion
-            yield f"data: {json.dumps({'type': 'complete', 'cleaned_data': cleaned_data, 'stats': stats, 'total_questions': len(cleaned_data)})}\\n\\n"
+            yield f"data: {json.dumps({'type': 'complete', 'cleaned_data': reduced_final, 'stats': stats, 'total_questions': len(reduced_final)})}\\n\\n"
             
         except Exception as e:
             app.logger.error(f"Streaming error: {e}")
