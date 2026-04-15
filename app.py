@@ -158,33 +158,59 @@ def call_aibot(prompt):
         response.raise_for_status()
 
         result = response.json()
-        print(f"AIBot result: {result['response']['content']}")
-        
+
         # Log the full response
         app.logger.info("="*60)
         app.logger.info("🤖 AIBot API Response")
-        app.logger.info(f"Response: {json.dumps(result, indent=2)}")
+        try:
+            app.logger.info(f"Response: {json.dumps(result, indent=2)}")
+        except Exception:
+            app.logger.info(f"Response (raw): {str(result)[:1000]}")
         app.logger.info("="*60)
-        
-        # Parse AIBot response format
-        if 'choices' in result and len(result['choices']) > 0:
-            answer = result['choices'][0]['message']['content'].strip()
-            app.logger.info(f"✅ Parsed Answer: {answer}")
-            return answer
-        elif 'response' in result:
-            # Handle both string and dict formats
-            if isinstance(result['response'], dict) and 'content' in result['response']:
-                answer = result['response']['content'].strip()
-            elif isinstance(result['response'], str):
-                answer = result['response'].strip()
-            else:
-                answer = str(result['response']).strip()
-            app.logger.info(f"✅ Parsed Answer: {answer}")
-            return answer
-        elif isinstance(result, str):
-            answer = result.strip()
-            app.logger.info(f"✅ Parsed Answer: {answer}")
-            return answer
+
+        # If the API already returned a structured QA object, accept it directly
+        if isinstance(result, dict) and any(k in result for k in ('is_potential_qa', 'raw_intent', 'public_question', 'case_id', 'confidence')):
+            app.logger.info("✅ AIBot returned structured QA object")
+            return result
+
+        # Parse AIBot response format (traditional shapes)
+        if isinstance(result, dict) and 'choices' in result and len(result['choices']) > 0:
+            answer = result['choices'][0].get('message', {}).get('content', '')
+            answer = answer.strip() if isinstance(answer, str) else str(answer)
+            app.logger.info(f"✅ Parsed Answer from choices: {answer}")
+            # Try to parse JSON from the answer
+            parsed = _parse_possible_json(answer)
+            return parsed if parsed is not None else answer
+
+        if isinstance(result, dict) and 'response' in result:
+            resp = result['response']
+            # If response itself is a structured QA object
+            if isinstance(resp, dict) and any(k in resp for k in ('is_potential_qa', 'raw_intent', 'public_question', 'case_id', 'confidence')):
+                app.logger.info("✅ AIBot 'response' field contains structured QA object")
+                return resp
+
+            if isinstance(resp, dict) and 'content' in resp and isinstance(resp['content'], str):
+                answer = resp['content'].strip()
+                app.logger.info(f"✅ Parsed Answer from response.content: {answer}")
+                parsed = _parse_possible_json(answer)
+                return parsed if isinstance(parsed, dict) else answer
+
+            if isinstance(resp, str):
+                parsed = _parse_possible_json(resp)
+                if isinstance(parsed, dict):
+                    return parsed
+                return resp.strip()
+
+            # Fallback to stringifying
+            return str(resp).strip()
+
+        # If result is a raw string (rare), try to parse JSON then return string
+        if isinstance(result, str):
+            parsed = _parse_possible_json(result)
+            if isinstance(parsed, dict):
+                return parsed
+            return result.strip()
+
         return None
     except Exception as e:
         # Try to extract API error details if present
@@ -791,6 +817,12 @@ def _parse_possible_json(s):
     s_stripped = s.strip()
     if not s_stripped:
         return s
+    # Strip markdown code fences (```json ... ``` or ``` ... ```)
+    if s_stripped.startswith('```'):
+        lines = s_stripped.splitlines()
+        # Drop the opening fence line and the closing fence line
+        inner = lines[1:-1] if len(lines) > 2 and lines[-1].strip() == '```' else lines[1:]
+        s_stripped = '\n'.join(inner).strip()
     if (s_stripped.startswith('{') or s_stripped.startswith('[')):
         try:
             return json.loads(s_stripped)
